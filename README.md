@@ -25,6 +25,13 @@
 - 检查点结果显示模式与 SQLite 原始三项（**busy、WAL 总帧数、已回写帧数**）及
   操作后 WAL 文件字节数（文件不存在记 0）；状态刷新只读内存缓存，不触发检查点
 - 检查点不代替两栏提交 / 回滚，也不替换任何连接
+- **删除实验**：页面「删除实验」按钮（确认后删除）或
+  `DELETE /api/experiments/<id>`。删除一开始，该实验的操作、状态、
+  已提交值、检查点新请求立即返回 **410**；此前已进入的请求正常完成后，
+  才回滚未提交事务、关闭长期及临时连接、删除数据库与 WAL / SHM 文件，
+  全部完成才返回删除成功。删除等待只针对本实验，不阻塞其他实验；
+  本次运行内重复删除同一 ID 仍返回 410，从未存在的 ID 返回 404。
+  页面收到删除成功或 410 后停止轮询并禁用旧实验操作，可手动「新建实验」
 - 实验仅保存在内存中，无需跨重启保留
 
 ## 数值约定
@@ -162,6 +169,27 @@ curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
 curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
   -H 'Content-Type: application/json' -d '{"op":"rollback"}'
 ```
+
+#### 删除实验（HTTP）
+
+```bash
+# 删除实验：等待在途请求完成、回滚未提交事务、关闭连接并删除
+# 数据库与 WAL/SHM 文件后才返回
+curl -s -X DELETE http://localhost:8000/api/experiments/$EXP
+# {"deleted":true,"id":"...","ok":true}
+
+# 删除一开始，该实验的所有接口立即返回 410 Gone
+curl -s http://localhost:8000/api/experiments/$EXP/status
+# {"error":"experiment deleted"}        （HTTP 410）
+
+# 本次运行内再次删除同一 ID 仍为 410；从未存在的 ID 返回 404
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE http://localhost:8000/api/experiments/$EXP        # 410
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE http://localhost:8000/api/experiments/unknown123  # 404
+```
+
+> 页面上点击「删除实验」会先弹出确认框；删除成功或收到 410 后，
+> 页面停止轮询并禁用旧实验的全部操作（迟到响应不会恢复旧展示，
+> 也不会自动新建），「新建实验」按钮仍可随时手动创建新实验。
 
 > 提示：一栏的请求未完成时，该栏按钮会被禁用，另一栏仍可正常操作；
 > 两栏的状态轮询与「已提交值」均通过独立连接 / 内存状态完成，

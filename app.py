@@ -17,6 +17,15 @@ WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而�
 （PRAGMA wal_autocheckpoint=0），检查点时机完全由手动按钮 / HTTP 控制。
 检查点绝不代替两栏提交、回滚，也不替换连接；状态刷新只读取内存中
 最近一次检查点结果的缓存，不执行任何 SQL、不触发检查点。
+
+删除实验：DELETE /api/experiments/<id> 或页面「删除实验」按钮（需确认）。
+删除在注册表锁内先把实验摘除并记入 deleted_ids —— 从这一刻起该实验的
+操作、状态、已提交值、检查点新请求一律返回 410，本次运行内重复删除同一
+ID 也返回 410（从未存在的 ID 返回 404）。随后等待此前已进入的请求正常
+完成（只等本实验的在途计数，不阻塞其他实验），再回滚未提交事务、关闭
+长期连接（检查点临时连接随在途请求归零已先行关闭），最后移除数据库与
+WAL、SHM 文件，全部完成才报告删除成功。在途检查点一定先于文件移除
+结束，不会重新创建已删文件。
 """
 
 import os
@@ -51,6 +60,7 @@ OP_LABELS = {
 # 允许手动触发的检查点模式：SQL 片段直接拼入 PRAGMA，必须走白名单
 VALID_CHECKPOINT_MODES = {"PASSIVE", "TRUNCATE"}
 WAL_SUFFIX = "-wal"
+SHM_SUFFIX = "-shm"
 
 app = Flask(__name__)
 
@@ -117,6 +127,11 @@ class Experiment:
         self.checkpoint_lock = threading.Lock()
         self.checkpoint_last = None
         self.checkpoint_log = []
+        # 在途请求计数：删除时先在注册表摘除本实验（新请求立即 410），
+        # 再等待该计数归零 —— 此前已进入的请求全部正常完成后才清理连接
+        # 与文件。计数增减与注册表摘除在同一把注册表锁内排序，二者不会交错。
+        self.active = 0
+        self.active_cond = threading.Condition()
 
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
@@ -188,6 +203,29 @@ class Experiment:
             return os.path.getsize(self.db_path + WAL_SUFFIX)
         except OSError:
             return 0
+
+    def destroy(self):
+        """删除实验：回滚未提交事务、关闭全部长期连接，最后移除数据库文件。
+
+        调用前实验已从注册表摘除且在途请求已归零：不会有新请求触碰这些
+        连接，在途检查点的临时连接也已关闭，因此不会重新创建被删文件。
+        """
+        for side in ("a", "b"):
+            conn = self.conns[side]
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            conn.close()
+        self.observer.close()
+        # 最后一个连接关闭时 SQLite 会自行回收 WAL/SHM；这里统一兜底，
+        # 确保数据库与 WAL、SHM 文件全部被移除后才报告删除成功
+        for suffix in ("", WAL_SUFFIX, SHM_SUFFIX):
+            try:
+                os.remove(self.db_path + suffix)
+            except OSError:
+                pass
 
 
 def run_op(exp, side, op, value):
@@ -359,11 +397,36 @@ def run_checkpoint(exp, mode):
 # 实验注册表：仅保存在内存中，无需跨重启保留
 experiments = {}
 experiments_lock = threading.Lock()
+# 本次运行内已删除的实验 ID：删除一开始（从注册表摘除时）就记入，
+# 此后这些 ID 的所有接口一律返回 410，重复删除同样返回 410；
+# 从未存在过的 ID 返回 404
+deleted_ids = set()
 
 
-def get_experiment(exp_id):
+def acquire_experiment(exp_id):
+    """取出实验并登记一个在途请求，返回 (exp, None)。
+
+    实验已删除返回 (None, 410 响应)，从未存在返回 (None, 404 响应)。
+    计数登记与删除时的注册表摘除在同一把锁内完成：要么先登记成功
+    （删除会等本次请求完成），要么登记时已被摘除（直接 410），不会交错。
+    """
     with experiments_lock:
-        return experiments.get(exp_id)
+        exp = experiments.get(exp_id)
+        if exp is not None:
+            with exp.active_cond:
+                exp.active += 1
+            return exp, None
+        gone = exp_id in deleted_ids
+    if gone:
+        return None, (jsonify({"error": "experiment deleted"}), 410)
+    return None, (jsonify({"error": "experiment not found"}), 404)
+
+
+def release_experiment(exp):
+    """在途请求结束：归还计数，若删除正在等待则唤醒它。"""
+    with exp.active_cond:
+        exp.active -= 1
+        exp.active_cond.notify_all()
 
 
 @app.get("/")
@@ -382,62 +445,96 @@ def create_experiment():
 
 @app.get("/api/experiments/<exp_id>/status")
 def experiment_status(exp_id):
-    exp = get_experiment(exp_id)
-    if exp is None:
-        return jsonify({"error": "experiment not found"}), 404
-    # 两栏状态与检查点状态均来自内存缓存，不执行任何 SQL、不触发检查点
-    return jsonify(
-        {
-            "id": exp.id,
-            "a": exp.panel_state("a"),
-            "b": exp.panel_state("b"),
-            "checkpoint": exp.checkpoint_state(),
-        }
-    )
+    exp, err = acquire_experiment(exp_id)
+    if err:
+        return err
+    try:
+        # 两栏状态与检查点状态均来自内存缓存，不执行任何 SQL、不触发检查点
+        return jsonify(
+            {
+                "id": exp.id,
+                "a": exp.panel_state("a"),
+                "b": exp.panel_state("b"),
+                "checkpoint": exp.checkpoint_state(),
+            }
+        )
+    finally:
+        release_experiment(exp)
 
 
 @app.get("/api/experiments/<exp_id>/committed")
 def experiment_committed(exp_id):
-    exp = get_experiment(exp_id)
-    if exp is None:
-        return jsonify({"error": "experiment not found"}), 404
-    return jsonify({"committed": json_int(exp.committed_value())})
+    exp, err = acquire_experiment(exp_id)
+    if err:
+        return err
+    try:
+        return jsonify({"committed": json_int(exp.committed_value())})
+    finally:
+        release_experiment(exp)
 
 
 @app.post("/api/experiments/<exp_id>/checkpoint")
 @app.post("/api/experiments/<exp_id>/checkpoint/<mode>")
 def experiment_checkpoint(exp_id, mode=None):
-    exp = get_experiment(exp_id)
-    if exp is None:
-        return jsonify({"error": "experiment not found"}), 404
-    if mode is None:
-        data = request.get_json(silent=True) or {}
-        mode = data.get("mode")
-    mode = (mode or "").upper()
-    if mode not in VALID_CHECKPOINT_MODES:
-        return jsonify({"error": "mode must be PASSIVE or TRUNCATE"}), 400
-    return jsonify(run_checkpoint(exp, mode))
+    exp, err = acquire_experiment(exp_id)
+    if err:
+        return err
+    try:
+        if mode is None:
+            data = request.get_json(silent=True) or {}
+            mode = data.get("mode")
+        mode = (mode or "").upper()
+        if mode not in VALID_CHECKPOINT_MODES:
+            return jsonify({"error": "mode must be PASSIVE or TRUNCATE"}), 400
+        return jsonify(run_checkpoint(exp, mode))
+    finally:
+        release_experiment(exp)
 
 
 @app.post("/api/experiments/<exp_id>/conn/<side>/op")
 def experiment_op(exp_id, side):
-    exp = get_experiment(exp_id)
-    if exp is None:
-        return jsonify({"error": "experiment not found"}), 404
-    if side not in ("a", "b"):
-        return jsonify({"error": "unknown side"}), 400
-    data = request.get_json(silent=True) or {}
-    op = data.get("op")
-    if op not in VALID_OPS:
-        return jsonify({"error": "unknown op"}), 400
-    value = None
-    if op == "add":
-        value = parse_int(data.get("value"))
-        if value is None:
-            return jsonify({"error": "value must be an integer"}), 400
-        if abs(value) > MAX_ADD_ABS:
-            return jsonify({"error": "value too large"}), 400
-    return jsonify(run_op(exp, side, op, value))
+    exp, err = acquire_experiment(exp_id)
+    if err:
+        return err
+    try:
+        if side not in ("a", "b"):
+            return jsonify({"error": "unknown side"}), 400
+        data = request.get_json(silent=True) or {}
+        op = data.get("op")
+        if op not in VALID_OPS:
+            return jsonify({"error": "unknown op"}), 400
+        value = None
+        if op == "add":
+            value = parse_int(data.get("value"))
+            if value is None:
+                return jsonify({"error": "value must be an integer"}), 400
+            if abs(value) > MAX_ADD_ABS:
+                return jsonify({"error": "value too large"}), 400
+        return jsonify(run_op(exp, side, op, value))
+    finally:
+        release_experiment(exp)
+
+
+@app.delete("/api/experiments/<exp_id>")
+def delete_experiment(exp_id):
+    with experiments_lock:
+        exp = experiments.pop(exp_id, None)
+        if exp is None:
+            if exp_id in deleted_ids:
+                # 本次运行内已删除：再次删除仍返回 410
+                return jsonify({"error": "experiment deleted"}), 410
+            return jsonify({"error": "experiment not found"}), 404
+        # 删除开始：该实验的新请求从此刻起一律 410
+        deleted_ids.add(exp_id)
+    # 等待此前已进入的请求正常完成 —— 只等本实验的在途计数，
+    # 不持有注册表锁，不阻塞其他实验的任何操作
+    with exp.active_cond:
+        while exp.active > 0:
+            exp.active_cond.wait()
+    # 回滚未提交事务、关闭长期及临时连接、移除数据库与 WAL/SHM 文件，
+    # 全部完成才报告删除成功
+    exp.destroy()
+    return jsonify({"ok": True, "id": exp_id, "deleted": True})
 
 
 def prepare_data_dir():

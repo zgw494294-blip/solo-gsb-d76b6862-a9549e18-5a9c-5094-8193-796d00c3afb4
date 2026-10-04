@@ -136,6 +136,20 @@ header button:hover:not(:disabled) {
   background: #4b5563;
 }
 
+header button.danger {
+  background: #7f1d1d;
+  border-color: #b91c1c;
+}
+
+header button.danger:hover:not(:disabled) {
+  background: #991b1b;
+}
+
+.exp-error {
+  color: #fca5a5;
+  font-size: 13px;
+}
+
 .add-group {
   display: inline-flex;
   gap: 6px;

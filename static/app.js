@@ -1,17 +1,30 @@
 "use strict";
 
 let expId = null;
+// 当前实验已被显式删除：停止轮询、禁用旧实验操作，绝不自动新建
+let deleted = false;
 const lastRender = { a: "", b: "" };
+let statusTimer = null;
+let committedTimer = null;
 
 const $ = (id) => document.getElementById(id);
 
 class ExpGone extends Error {}
 
-async function fetchJson(path, options) {
+async function fetchJson(path, options, forId) {
   const resp = await fetch(path, options);
-  if (resp.status === 404) {
-    // 服务端重启后旧实验已不存在：自动新建一个，再通知调用方放弃本次请求
-    await newExperiment();
+  if (resp.status === 410 || resp.status === 404) {
+    // 仅当响应仍对应当前实验时才改变页面状态；迟到响应一律丢弃，
+    // 不得恢复旧展示，也不得在实验被显式删除后自动新建
+    if (forId === expId) {
+      if (resp.status === 410) {
+        // 实验已被删除：停止轮询并禁用旧实验操作
+        handleDeleted();
+      } else if (!deleted) {
+        // 服务端重启后旧实验已不存在：自动新建一个，再通知调用方放弃本次请求
+        await newExperiment();
+      }
+    }
     throw new ExpGone();
   }
   if (!resp.ok) {
@@ -20,31 +33,109 @@ async function fetchJson(path, options) {
   return resp.json();
 }
 
+function startPolling() {
+  stopPolling();
+  // 状态轮询只读取服务端内存状态，不执行任何 SELECT，不会提前建立快照
+  statusTimer = setInterval(() => {
+    refreshStatus().catch(() => {});
+  }, 2000);
+  committedTimer = setInterval(() => {
+    refreshCommitted();
+  }, 2000);
+}
+
+function stopPolling() {
+  if (statusTimer !== null) clearInterval(statusTimer);
+  if (committedTimer !== null) clearInterval(committedTimer);
+  statusTimer = committedTimer = null;
+}
+
+function setExperimentControlsEnabled(enabled) {
+  // 删除后禁用旧实验的全部操作；「新建实验」按钮始终可用
+  for (const el of document.querySelectorAll(
+    "#panel-a button, #panel-a input, #panel-b button, #panel-b input," +
+      "#ckpt-passive, #ckpt-truncate, #refresh-committed, #delete-exp"
+  )) {
+    el.disabled = !enabled;
+  }
+}
+
+function handleDeleted() {
+  if (deleted) return;
+  deleted = true;
+  const oldId = expId;
+  expId = null; // 迟到响应据此丢弃，不再渲染旧实验
+  stopPolling();
+  setExperimentControlsEnabled(false);
+  $("exp-id").textContent = oldId ? oldId + "（已删除）" : "已删除";
+  $("committed").textContent = "—";
+}
+
 async function newExperiment() {
   const resp = await fetch("/api/experiments", { method: "POST" });
   const data = await resp.json();
   expId = data.id;
+  deleted = false;
   history.replaceState(null, "", "?exp=" + expId);
   $("exp-id").textContent = expId;
   clearError("a");
   clearError("b");
   clearError("ckpt");
+  clearExpError();
+  setExperimentControlsEnabled(true);
   await refreshStatus();
   await refreshCommitted();
+  startPolling();
+}
+
+async function deleteExperiment() {
+  const id = expId;
+  if (!id || deleted) return;
+  if (
+    !window.confirm(
+      `确定删除当前实验 ${id} 吗？\n` +
+        "将回滚未提交事务、关闭全部连接并删除数据库文件（含 WAL / SHM），此操作不可撤销。"
+    )
+  ) {
+    return;
+  }
+  $("delete-exp").disabled = true;
+  clearExpError();
+  try {
+    const resp = await fetch(`/api/experiments/${id}`, { method: "DELETE" });
+    if (resp.ok || resp.status === 410 || resp.status === 404) {
+      // 删除成功（或该实验已不存在）：停止轮询并禁用旧实验操作
+      if (expId === id) handleDeleted();
+    } else {
+      showExpError("删除失败：HTTP " + resp.status);
+      if (!deleted) $("delete-exp").disabled = false;
+    }
+  } catch (e) {
+    showExpError("删除请求失败：" + e.message);
+    if (!deleted) $("delete-exp").disabled = false;
+  }
 }
 
 async function refreshStatus() {
-  if (!expId) return;
-  const data = await fetchJson(`/api/experiments/${expId}/status`);
+  const id = expId;
+  if (!id) return;
+  const data = await fetchJson(`/api/experiments/${id}/status`, undefined, id);
+  if (expId !== id) return; // 迟到响应：实验已删除或已切换，丢弃
   renderPanel("a", data.a);
   renderPanel("b", data.b);
   renderCheckpoint(data.checkpoint);
 }
 
 async function refreshCommitted() {
-  if (!expId) return;
+  const id = expId;
+  if (!id) return;
   try {
-    const data = await fetchJson(`/api/experiments/${expId}/committed`);
+    const data = await fetchJson(
+      `/api/experiments/${id}/committed`,
+      undefined,
+      id
+    );
+    if (expId !== id) return; // 迟到响应：不恢复旧展示
     $("committed").textContent = data.committed;
   } catch (e) {
     if (!(e instanceof ExpGone)) {
@@ -127,7 +218,19 @@ function clearError(side) {
   $("error-" + side).hidden = true;
 }
 
+function showExpError(message) {
+  const box = $("exp-error");
+  box.textContent = message;
+  box.hidden = false;
+}
+
+function clearExpError() {
+  $("exp-error").hidden = true;
+}
+
 async function doOp(side, op) {
+  const id = expId;
+  if (!id) return;
   const body = { op };
   if (op === "add") {
     const raw = $(`add-input-${side}`).value.trim();
@@ -146,22 +249,27 @@ async function doOp(side, op) {
   setBusy(side, true);
   clearError(side);
   try {
-    const data = await fetchJson(`/api/experiments/${expId}/conn/${side}/op`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const data = await fetchJson(
+      `/api/experiments/${id}/conn/${side}/op`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      id
+    );
+    if (expId !== id) return; // 迟到响应不得恢复旧展示
     renderPanel(side, data.state);
     if (!data.ok && data.error) {
       showError(side, data.error);
     }
     refreshCommitted();
   } catch (e) {
-    if (!(e instanceof ExpGone)) {
+    if (!(e instanceof ExpGone) && expId === id) {
       showError(side, { name: null, code: null, message: "请求失败：" + e.message });
     }
   } finally {
-    setBusy(side, false);
+    if (!deleted) setBusy(side, false);
   }
 }
 
@@ -178,22 +286,27 @@ function setCheckpointBusy(busy) {
 }
 
 async function doCheckpoint(mode) {
+  const id = expId;
+  if (!id) return;
   setCheckpointBusy(true);
   clearError("ckpt");
   try {
-    const data = await fetchJson(`/api/experiments/${expId}/checkpoint/${mode}`, {
-      method: "POST",
-    });
+    const data = await fetchJson(
+      `/api/experiments/${id}/checkpoint/${mode}`,
+      { method: "POST" },
+      id
+    );
+    if (expId !== id) return; // 迟到响应不得恢复旧展示
     renderCheckpoint(data.state);
     if (!data.ok && data.error) {
       showError("ckpt", data.error);
     }
   } catch (e) {
-    if (!(e instanceof ExpGone)) {
+    if (!(e instanceof ExpGone) && expId === id) {
       showError("ckpt", { name: null, code: null, message: "请求失败：" + e.message });
     }
   } finally {
-    setCheckpointBusy(false);
+    if (!deleted) setCheckpointBusy(false);
   }
 }
 
@@ -202,6 +315,9 @@ async function init() {
   bindPanel("b");
   $("new-exp").addEventListener("click", () => {
     newExperiment().catch(() => {});
+  });
+  $("delete-exp").addEventListener("click", () => {
+    deleteExperiment().catch(() => {});
   });
   $("refresh-committed").addEventListener("click", () => {
     refreshCommitted();
@@ -222,19 +338,12 @@ async function init() {
       await refreshStatus();
       await refreshCommitted();
     } catch (e) {
-      // 404 时 fetchJson 已自动新建实验
+      // 404 时 fetchJson 已自动新建实验；410 时已按「已删除」处理
     }
+    if (!deleted && expId) startPolling();
   } else {
     await newExperiment();
   }
-
-  // 状态轮询只读取服务端内存状态，不执行任何 SELECT，不会提前建立快照
-  setInterval(() => {
-    refreshStatus().catch(() => {});
-  }, 2000);
-  setInterval(() => {
-    refreshCommitted();
-  }, 2000);
 }
 
 init();

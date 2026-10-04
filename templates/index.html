@@ -12,6 +12,8 @@
     <div class="exp-bar">
       <span>实验 ID：<code id="exp-id">…</code></span>
       <button id="new-exp" type="button">新建实验</button>
+      <button id="delete-exp" type="button" class="danger">删除实验</button>
+      <span class="exp-error" id="exp-error" hidden></span>
       <span class="spacer"></span>
       <span>已提交值（第三条连接）：<strong id="committed" class="committed-value">…</strong></span>
       <button id="refresh-committed" type="button">刷新</button>
@@ -81,7 +83,10 @@
   <footer>
     <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照，也不触发检查点
        （检查点结果只读内存缓存）；写锁冲突会立即返回
-       SQLite 错误名与错误码，不阻塞另一栏，也不会自动结束失败的事务；修改操作只允许在事务内进行。</p>
+       SQLite 错误名与错误码，不阻塞另一栏，也不会自动结束失败的事务；修改操作只允许在事务内进行。
+       「删除实验」需确认：删除开始后该实验全部接口返回 410，在途请求正常完成后回滚未提交事务、
+       关闭连接并删除数据库文件（含 WAL / SHM）；删除后页面停止轮询并禁用旧实验操作，
+       可手动「新建实验」。</p>
   </footer>
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>
