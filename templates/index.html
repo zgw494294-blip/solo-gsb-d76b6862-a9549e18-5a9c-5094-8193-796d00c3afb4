@@ -12,10 +12,13 @@
     <div class="exp-bar">
       <span>实验 ID：<code id="exp-id">…</code></span>
       <button id="new-exp" type="button">新建实验</button>
+      <button id="delete-exp" class="danger" type="button">删除当前实验</button>
       <span class="spacer"></span>
       <span>已提交值（第三条连接）：<strong id="committed" class="committed-value">…</strong></span>
       <button id="refresh-committed" type="button">刷新</button>
     </div>
+    <div class="error-box deleted-note" id="deleted-note" hidden></div>
+    <div class="error-box" id="error-exp" hidden></div>
   </header>
 
   <main>

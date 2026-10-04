@@ -136,6 +136,32 @@ header button:hover:not(:disabled) {
   background: #4b5563;
 }
 
+header button.danger {
+  background: #7f1d1d;
+  border-color: #991b1b;
+}
+
+header button.danger:hover:not(:disabled) {
+  background: #991b1b;
+}
+
+.deleted-note {
+  margin: 10px 0 0;
+  background: #1f2937;
+  border-color: #f59e0b;
+  color: #fcd34d;
+  line-height: 1.7;
+}
+
+#error-exp {
+  margin: 8px 0 0;
+}
+
+.exp-frozen {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
 .add-group {
   display: inline-flex;
   gap: 6px;
